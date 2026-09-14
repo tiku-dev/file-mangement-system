@@ -9,9 +9,11 @@ import { Hono } from "hono";
 import { healthRoutes } from "./health.js";
 import { authRoutes } from "./auth.js";
 import { aiRoutes } from "./ai.js";
+import { mobileRoutes } from "./mobile.js";
 import type { AppVariables } from "../core/auth.js";
 
 export const apiRoutes = new Hono<AppVariables>()
   .route("/health", healthRoutes)
   .route("/auth", authRoutes)
-  .route("/ai", aiRoutes);
+  .route("/ai", aiRoutes)
+  .route("/mobile", mobileRoutes);

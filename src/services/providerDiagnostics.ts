@@ -88,6 +88,7 @@ export interface ProviderDiagnosticsInput {
 
 /** Providers that cannot operate without a credential (mirrors composition). */
 const REQUIRES_CREDENTIAL: ReadonlySet<ProviderIdType> = new Set([
+  "groq",
   "grok",
   "gemini",
   "openrouter",

@@ -43,6 +43,7 @@ import type { AgentProvider } from "./provider.js";
  * agent contracts remain untouched.
  */
 export const ProviderId = {
+  Groq: "groq",
   /** Grok — served by the xAI API through the Phase 10.9 adapter. */
   Grok: "grok",
   /** Gemini — served by the Google AI Studio API through the Phase 10.14 adapter. */

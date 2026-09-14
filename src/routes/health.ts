@@ -6,13 +6,14 @@
  */
 import { Hono } from "hono";
 import { getDatabase } from "../database/client.js";
+import { getAiRuntimeStatus } from "../services/aiStatus.js";
 
 /** Components that are deliberately not built yet — unchanged statuses. */
 const COMPONENT_STATUSES = {
-  objectStorage: "not-configured",
-  sync: "not-implemented",
-  authentication: "not-implemented",
-  ai: "not-implemented",
+  objectStorage: "not-required",
+  sync: "not-required",
+  authentication: "ok",
+  mobileApi: "ready",
 } as const;
 
 /** How long the database liveness probe may take before reporting an error. */
@@ -40,10 +41,11 @@ async function checkDatabase(): Promise<"ok" | "error"> {
 
 export const healthRoutes = new Hono().get("/", async (c) => {
   const database = await checkDatabase();
+  const ai = getAiRuntimeStatus().status === "ok" ? "configured" : "not-configured";
   return c.json({
     status: "ok",
     service: "smart-file-manager-backend",
     time: new Date().toISOString(),
-    components: { ...COMPONENT_STATUSES, database },
+    components: { ...COMPONENT_STATUSES, ai, database },
   });
 });

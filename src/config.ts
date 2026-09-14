@@ -72,6 +72,16 @@ export const config = {
   corsOrigins: listFromEnv(process.env.CORS_ORIGINS) ?? DEFAULT_DEV_ORIGINS,
   /** Session lifetime in hours (Phase 7). Safe production-oriented default. */
   sessionTtlHours: Math.max(1, intFromEnv(process.env.SESSION_TTL_HOURS) ?? 12),
+  groq: {
+    apiKey: envStringOrUndefined(process.env.GROQ_API_KEY),
+    credentials: credentialsFromEnv("GROQ"),
+    model: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
+    baseUrl: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
+    timeoutMs: Math.max(
+      1000,
+      intFromEnv(process.env.GROQ_TIMEOUT_MS) ?? 60_000,
+    ),
+  },
   /**
    * Grok (xAI) provider settings (Phase 10.9).
    *
@@ -168,7 +178,7 @@ export const config = {
    * the provider-selection layer; the value is validated against the known
    * provider ids at resolution time. Defaults to the built-in Grok adapter.
    */
-  aiProvider: process.env.AI_PROVIDER ?? "grok",
+  aiProvider: process.env.AI_PROVIDER ?? "groq",
   /**
    * The ordered fallback chain (Phase 10.17). A comma-separated list of
    * provider ids tried in order on rotation-eligible failures. When unset,
@@ -176,7 +186,7 @@ export const config = {
    * the fallback list IS the chain (the first entry is primary).
    */
   aiProviderFallback: listFromEnv(process.env.AI_PROVIDER_FALLBACK) ?? [
-    process.env.AI_PROVIDER ?? "grok",
+    process.env.AI_PROVIDER ?? "groq",
   ],
   /**
    * Credential cooldown window in milliseconds (Phase 10.18). After a

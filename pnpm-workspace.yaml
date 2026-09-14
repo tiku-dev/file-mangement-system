@@ -1,0 +1,14 @@
+# pnpm settings (pnpm >= 11 no longer reads the "pnpm" field in package.json).
+#
+# Supply-chain guard: dependency postinstall scripts are blocked by default.
+# esbuild (transitive dependency of tsx, used to run TypeScript directly) is
+# the only build script this project allows to run. Anything new must be
+# consciously added here. (Recorded via `pnpm approve-builds esbuild`.)
+#
+# Prisma 7 is engine-free: `prisma`, `@prisma/client` and `@prisma/engines`
+# declare build scripts for the legacy Rust engine flow, but none are needed
+# here — explicitly denied to keep the guard strict.
+allowBuilds:
+  '@prisma/engines': false
+  esbuild: true
+  prisma: false

@@ -1,0 +1,643 @@
+// Smart File Manager — Prisma data model (Phase 6 implementation step).
+//
+// Translated 1:1 from the authoritative design: ../src/database/SCHEMA.md
+// (§5 core tables, §6 AI tables). Table/column names are snake_case via
+// @@map/@map; model/field names stay idiomatic PascalCase/camelCase.
+//
+// RAW-SQL POLICY — everything PostgreSQL needs that the Prisma schema language
+// cannot express (CHECK constraints, partial/expression unique indexes,
+// work-queue partial indexes, the citext extension) is marked inline with:
+//     CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §…
+// Nothing here weakens the documented design. No migration is created in this
+// step, and no database may be created without explicit approval.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/database/generated/prisma"
+  runtime                = "nodejs"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Core tables (SCHEMA.md §5)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Accounts. SCHEMA.md §5.1 — ownership root (D3): every user-visible table
+// carries user_id pointing here.
+// ---------------------------------------------------------------------------
+
+model User {
+  // PK. UUID defaults are database-generated (§15).
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // text. UNIQUE case-insensitively — CUSTOM SQL REQUIRED IN MIGRATION:
+  //   UNIQUE (lower(email)) expression index (or citext; §15) — see SCHEMA.md §5.1.
+  //   (No native @unique: that would create a case-SENSITIVE unique, which the
+  //   spec does not call for.)
+  email        String
+  displayName  String   @map("display_name")
+  // Argon2/bcrypt hash; populated in Phase 7 (§14); never returned by any API.
+  passwordHash String   @map("password_hash")
+  // text. CHECK (status IN ('active','disabled')) DEFAULT 'active'
+  //   — CHECK via CUSTOM SQL (Prisma cannot express CHECK constraints);
+  //   @default covers the documented DEFAULT 'active' — see SCHEMA.md §5.1.
+  status       String   @default("active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz
+
+  devices          Device[]
+  folders          Folder[]
+  files            File[]
+  tags             Tag[]
+  activityEvents   ActivityEvent[]
+  aiConversations  AiConversation[]
+  aiFileReferences AiFileReference[]
+  aiAnalyses       AiAnalysis[]
+  aiInstructions   AiInstruction[]
+  aiActions        AiAction[]
+  aiToolApprovals  AiToolApproval[]
+  sessions         Session[]
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Registered desktop clients. SCHEMA.md §5.2. Deleting a device cascades its
+// sync state but never the versions it uploaded (FileVersion.deviceId SET NULL).
+// ---------------------------------------------------------------------------
+
+model Device {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  // Client-generated stable UUID persisted in desktop config (not OS hostname).
+  deviceUid  String   @map("device_uid")
+  name       String
+  platform   String? // informational: 'macos' | 'windows' | 'linux'
+  appVersion String?  @map("app_version") // informational
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceFileStates DeviceFileState[]
+  uploadedVersions FileVersion[]     @relation("DeviceUploadedVersions")
+  activityEvents   ActivityEvent[]
+
+  @@unique([userId, deviceUid])
+  @@index([userId])
+  @@map("devices")
+}
+
+// ---------------------------------------------------------------------------
+// Server-side auth sessions. SCHEMA.md §14 (Phase 7): opaque bearer tokens
+// are stored hashed (SHA-256 of the raw token — the raw token itself never
+// touches the database); expiry is server-enforced by auth middleware. The
+// sessions table ships in Phase 7; registration/login/logout arrive later..
+// ---------------------------------------------------------------------------
+
+model Session {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  // SHA-256 hex of the opaque session token. UNIQUE (case-sensitive is fine:
+  // hashes are random 32-byte values, not login identities).
+  tokenHash  String   @unique @map("token_hash")
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ─── Folder / File / FileVersion — SCHEMA.md §5.3–§5.5 ──────────────────────
+
+model Folder {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  parentFolderId String?   @map("parent_folder_id") @db.Uuid
+  name           String
+  isStarred      Boolean   @default(false) @map("is_starred")
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @default(now()) @map("updated_at") @db.Timestamptz
+
+  // Self-referencing tree — NULL parent_folder_id = the user's root.
+  parentFolder Folder?  @relation("FolderTree", fields: [parentFolderId], references: [id], onDelete: Cascade)
+  childFolders Folder[] @relation("FolderTree")
+
+  user                        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  files                       File[]
+  folderTags                  FolderTag[]
+  activityEvents              ActivityEvent[]
+  // Provenance back-references from AI actions (ON DELETE SET NULL lives on AiAction).
+  aiActionsTargetingThis      AiAction[]      @relation("AiActionTargetFolder")
+  aiActionsUsingAsDestination AiAction[]      @relation("AiActionDestinationFolder")
+
+  // CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.3:
+  //  1. UNIQUE (parent_folder_id, lower(name)) WHERE deleted_at IS NULL
+  //     (sibling names unique among non-deleted rows; expression + partial).
+  //  2. UNIQUE (user_id) WHERE parent_folder_id IS NULL
+  //     (exactly one root folder per user).
+  //  3. Partial index (user_id) WHERE is_starred (Starred view).
+  //  4. Partial index (user_id) WHERE deleted_at IS NOT NULL (Trash view).
+  //  5. CHECK (char_length(name) BETWEEN 1 AND 255).
+  // NOTE: folder moves must reject a target folder that is a descendant of
+  // the source (cycle prevention) — enforced by application services (§9);
+  // not expressible as a plain constraint.
+
+  @@index([userId, parentFolderId])
+  @@map("folders")
+}
+
+model File {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  parentFolderId   String    @map("parent_folder_id") @db.Uuid
+  name             String
+  mimeType         String?   @map("mime_type")
+  currentVersionId String?   @unique @map("current_version_id") @db.Uuid
+  isStarred        Boolean   @default(false) @map("is_starred")
+  deletedAt        DateTime? @map("deleted_at") @db.Timestamptz
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime  @default(now()) @map("updated_at") @db.Timestamptz
+
+  parentFolder Folder @relation(fields: [parentFolderId], references: [id], onDelete: Cascade)
+  user         User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Circular relationship with FileVersion (SCHEMA.md §7 / §15) — two
+  // relations between the same pair, so BOTH sides carry explicit names:
+  //   file_versions.file_id          → files.id (relation "FileVersions")
+  //   files.current_version_id       → file_versions.id (relation "CurrentVersion")
+  // current_version_id is NULL until the first version's bytes are uploaded;
+  // ON DELETE SET NULL is a defensive net around the "never delete the
+  // current version" rule. @unique on the FK also provides SCHEMA.md's
+  // required INDEX (current_version_id).
+  currentVersion FileVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  versions       FileVersion[] @relation("FileVersions")
+
+  deviceFileStates DeviceFileState[]
+  fileTags         FileTag[]
+  activityEvents   ActivityEvent[]
+  aiFileReferences AiFileReference[]
+  aiAnalyses       AiAnalysis[]
+  aiActions        AiAction[] // AiAction.targetFile (unnamed relation)
+
+  // CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.4:
+  //  1. UNIQUE (parent_folder_id, lower(name)) WHERE deleted_at IS NULL.
+  //  2. Partial index (user_id) WHERE is_starred.
+  //  3. CHECK (char_length(name) BETWEEN 1 AND 255).
+  // NOTE: mime_type is determined server-side at upload, never trusted from
+  // the client (design decision D9).
+
+  @@index([userId, parentFolderId])
+  @@index([userId, deletedAt])
+  @@map("files")
+}
+
+model FileVersion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  fileId        String   @map("file_id") @db.Uuid
+  versionNumber Int      @map("version_number")
+  storageKey    String   @map("storage_key")
+  sizeBytes     BigInt   @map("size_bytes")
+  sha256        String   @db.Char(64)
+  deviceId      String?  @map("device_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  file   File    @relation("FileVersions", fields: [fileId], references: [id], onDelete: Cascade)
+  device Device? @relation("DeviceUploadedVersions", fields: [deviceId], references: [id], onDelete: SetNull)
+
+  // Other side of the circular FK — a version is "current" for at most one file.
+  currentForFile File? @relation("CurrentVersion")
+
+  // Per-device provenance (ON DELETE SET NULL lives on DeviceFileState).
+  deviceFileStatesWithLocalVersion       DeviceFileState[] @relation("DeviceLocalVersion")
+  deviceFileStatesWithConflictingVersion DeviceFileState[] @relation("DeviceConflictingVersion")
+
+  aiFileReferences AiFileReference[]
+  aiAnalyses       AiAnalysis[]
+
+  // CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.5:
+  //  1. CHECK (size_bytes >= 0).
+  //  2. CHECK (version_number >= 1).
+  // NOTE: @@unique([storageKey]) enforces one object per version for now;
+  // SCHEMA.md flags this UNIQUE for relaxation if Phase 8 introduces
+  // content-addressed dedupe (same bytes → shared object).
+  // Versions are immutable by design — only ever created, never mutated (§5.5).
+
+  @@unique([fileId, versionNumber])
+  @@unique([storageKey])
+  @@index([sha256])
+  @@map("file_versions")
+}
+
+// ---------------------------------------------------------------------------
+// User-defined labels. SCHEMA.md §5.6.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.6:
+//   - UNIQUE (user_id, lower(name)) — expression index; also serves every
+//     (user_id)-prefix lookup, so no standalone user_id index (audit).
+// ---------------------------------------------------------------------------
+
+model Tag {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String
+  color     String? // UI hint; validated app-side
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileTags   FileTag[]
+  folderTags FolderTag[]
+
+  @@map("tags")
+}
+
+// file_tags / folder_tags (§5.7) — separate link tables, never one polymorphic
+// column (D1): each table's own FKs make cross-target attachment structurally
+// impossible. Cross-user pairing (item and tag of the same user) is
+// app-enforced on every link/unlink (§13).
+
+model FileTag {
+  fileId    String   @map("file_id") @db.Uuid
+  tagId     String   @map("tag_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  file File @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([fileId, tagId])
+  @@index([tagId]) // reverse lookup: all files with tag X
+  @@map("file_tags")
+}
+
+model FolderTag {
+  folderId  String   @map("folder_id") @db.Uuid
+  tagId     String   @map("tag_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  folder Folder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([folderId, tagId])
+  @@index([tagId]) // reverse lookup: all folders with tag X
+  @@map("folder_tags")
+}
+
+// ---------------------------------------------------------------------------
+// The local ↔ cloud sync bridge. SCHEMA.md §5.8/§11 — a row existing means
+// "this file is selected for sync on this device" (D7). Per-device status,
+// errors, and conflict bookkeeping stay off the shared file record; one
+// device's error never blocks another.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.8:
+//   - CHECK (sync_status IN ('synced','pending_upload','uploading',
+//     'pending_download','downloading','conflict','error'))
+//   - partial (device_id) WHERE sync_status <> 'synced' — work/retry queue
+// ---------------------------------------------------------------------------
+
+model DeviceFileState {
+  deviceId             String    @map("device_id") @db.Uuid
+  fileId               String    @map("file_id") @db.Uuid
+  localPath            String?   @map("local_path") // informational only — server never acts on it (§1.1)
+  localMtime           DateTime? @map("local_mtime") @db.Timestamptz // device-reported; untrusted (D9)
+  localVersionId       String?   @map("local_version_id") @db.Uuid // last version this device confirmed it holds
+  syncStatus           String    @map("sync_status")
+  conflictingVersionId String?   @map("conflicting_version_id") @db.Uuid // where the conflict "loser" is preserved (a full version — nothing lost)
+  lastError            String?   @map("last_error") // retry display
+  lastSyncedAt         DateTime? @map("last_synced_at") @db.Timestamptz
+  updatedAt            DateTime? @map("updated_at") @db.Timestamptz
+
+  device             Device       @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  file               File         @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  localVersion       FileVersion? @relation("DeviceLocalVersion", fields: [localVersionId], references: [id], onDelete: SetNull)
+  conflictingVersion FileVersion? @relation("DeviceConflictingVersion", fields: [conflictingVersionId], references: [id], onDelete: SetNull)
+
+  @@id([deviceId, fileId])
+  @@index([fileId]) // "which devices hold this file"
+  @@map("device_file_state")
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem activity history (Recent view, audit). SCHEMA.md §5.9/§12 —
+// append-only log of what actually changed; AI-driven operations are written
+// here by services, so the audit trail is uniform (A1). Deliberately separate
+// from AI conversation history (§12).
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §5.9:
+//   - CHECK (action IN ('upload','download','create','rename','move','delete',
+//     'restore','star','unstar','tag','untag'))
+//   - app-enforced: at least one of file_id/folder_id for filesystem actions
+// ---------------------------------------------------------------------------
+
+model ActivityEvent {
+  id         BigInt   @id @default(autoincrement()) // monotonic; natural cursor (D10)
+  userId     String   @map("user_id") @db.Uuid
+  deviceId   String?  @map("device_id") @db.Uuid // NULL = web- or AI-originated
+  fileId     String?  @map("file_id") @db.Uuid
+  folderId   String?  @map("folder_id") @db.Uuid
+  action     String
+  detail     Json? // e.g. rename from/to, AI provenance {"source":"ai",...} (§12)
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  file   File?   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  folder Folder? @relation(fields: [folderId], references: [id], onDelete: Cascade)
+
+  @@index([userId, occurredAt(sort: Desc)]) // Recent feed
+  @@index([fileId]) // per-file history
+  @@map("activity_events")
+}
+
+// ---------------------------------------------------------------------------
+// Persistent AI conversations. SCHEMA.md §6.1. Conversation history is
+// deliberately separate from filesystem activity history (§12): deleting a
+// conversation deletes its transcript and scoped references — never
+// filesystem history.
+// ---------------------------------------------------------------------------
+
+model AiConversation {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  title     String? // auto-derived from the first message; user-renamable
+  // Phase 10.26A: arbitrary archive timestamp. NULL = active; NOT NULL =
+  // archived (hidden from the normal conversation list but not deleted).
+  // NOT soft-delete — an archived conversation and its transcript are retained
+  // and remain directly retrievable; see SCHEMA.md §6.1.
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
+  // Phase 10.7: strict bound for the bounded agent tool loop, so a persisted
+  // conversation can reconstruct its turn progress without re-implementing
+  // the loop. Enduring per-conversation, not per-turn.
+  maxToolRounds Int      @default(1) @map("max_tool_rounds")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @default(now()) @map("updated_at") @db.Timestamptz // bumps on new messages
+
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages       AiMessage[]
+  fileReferences AiFileReference[]
+  actions        AiAction[]
+  toolApprovals  AiToolApproval[]
+
+  @@index([userId, updatedAt(sort: Desc)]) // conversation list
+  @@map("ai_conversations")
+}
+
+// ---------------------------------------------------------------------------
+// Transcript messages. SCHEMA.md §6.2 — append-only; corrections are new
+// messages, never edits.
+// ---------------------------------------------------------------------------
+
+model AiMessage {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  // text. CHECK (role IN ('user','assistant','system'))
+  //   — CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.2.
+  role           String
+  content        String
+  // jsonb. Non-semantic data: model, token usage, latency.
+  metadata       Json?
+  // Phase 10.7: structured turn data for the bounded agent tool loop
+  // (Phase 10.6 state). One ai_messages row per recorded step (instruction =
+  // role 'user'; provider round = role 'assistant' with tool_calls and its
+  // tool_results; terminal reply = role 'assistant' with is_final = true).
+  // Raw tool data is JSONB: intents, structured results, exact
+  // file_id/version_id references — never file contents.
+  toolCalls   Json?   @map("tool_calls")
+  toolResults Json?   @map("tool_results")
+  isFinal     Boolean @default(false) @map("is_final")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  conversation   AiConversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  fileReferences AiFileReference[]
+  actions        AiAction[]
+  toolApprovals  AiToolApproval[]
+
+  @@index([conversationId, createdAt]) // ordered transcript read
+  @@map("ai_messages")
+}
+
+// ---------------------------------------------------------------------------
+// "What the AI was looking at". SCHEMA.md §6.3 (A2): a citation linking an AI
+// context to a file and — when applicable — the exact version read/analyzed.
+// version_id NULL = file-level mention; NOT NULL = exact version cited.
+// Historical fact; never blocks deletion (§6.3).
+// CUSTOM SQL REQUIRED IN MIGRATION: CHECK
+//   (num_nonnulls(conversation_id, message_id, analysis_id, action_id) = 1)
+// — the exact-one-context rule (most specific context wins) — see SCHEMA.md §6.3.
+// ---------------------------------------------------------------------------
+
+model AiFileReference {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  fileId         String   @map("file_id") @db.Uuid
+  versionId      String?  @map("version_id") @db.Uuid // degrades to file-level when the version is deleted (SET NULL)
+  conversationId String?  @map("conversation_id") @db.Uuid
+  messageId      String?  @map("message_id") @db.Uuid
+  analysisId     String?  @map("analysis_id") @db.Uuid
+  actionId       String?  @map("action_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  file         File            @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  version      FileVersion?    @relation(fields: [versionId], references: [id], onDelete: SetNull)
+  conversation AiConversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      AiMessage?      @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  analysis     AiAnalysis?     @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  action       AiAction?       @relation(fields: [actionId], references: [id], onDelete: Cascade)
+
+  @@index([fileId])
+  @@index([versionId])
+  @@index([conversationId, createdAt])
+  @@index([analysisId])
+  @@index([actionId])
+  @@index([messageId])
+  @@map("ai_file_references")
+}
+
+// ---------------------------------------------------------------------------
+// Structured AI analysis of a specific file version. SCHEMA.md §6.4 —
+// summaries, classifications, tag suggestions, and organization proposals
+// live HERE (ai_file_insights was dropped; this table covers it). Completed
+// analyses are immutable: re-analysis = a new row. Large extracted text goes
+// to object storage via extracted_text_key — never inline bulk text (§2.2).
+// Tag suggestions are proposals only: applied solely through an AiAction
+// (action_type apply_tags) executed by a service like any user action (§6.4).
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.4:
+//   - CHECK (analysis_kind IN ('summary','classification','tag_suggestion',
+//     'organization_suggestion','content_extraction','duplicate_hint'))
+//   - CHECK (status IN ('pending','completed','failed'))
+//   - partial (user_id) WHERE status = 'pending' — analysis work queue
+// ---------------------------------------------------------------------------
+
+model AiAnalysis {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  fileId           String    @map("file_id") @db.Uuid
+  versionId        String    @map("version_id") @db.Uuid // the exact version analyzed (A2)
+  analysisKind     String    @map("analysis_kind")
+  status           String
+  resultData       Json?     @map("result_data") // structured result, e.g. {"suggestedTags":[...]}
+  resultSummary    String?   @map("result_summary") // human-readable; display without parsing JSON
+  extractedTextKey String?   @map("extracted_text_key") // object-storage reference (§2.2)
+  model            String? // provenance only; provider/model-selection infra deferred (§14)
+  error            String? // failure detail when status = failed
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  completedAt      DateTime? @map("completed_at") @db.Timestamptz
+
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  file           File              @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  version        FileVersion       @relation(fields: [versionId], references: [id], onDelete: Cascade) // derived data follows its version
+  fileReferences AiFileReference[]
+
+  @@index([fileId, versionId]) // analyses of a file
+  @@index([userId, analysisKind, createdAt(sort: Desc)]) // "recent tag suggestions"
+  @@map("ai_analyses")
+}
+
+// ---------------------------------------------------------------------------
+// Reusable user instructions / preferences. SCHEMA.md §6.5 — standing
+// instructions that persist across conversations. `instruction` holds the
+// denormalized CURRENT text; every change appends an AiInstructionVersion row
+// (§6.6) and the app maintains instruction = max(version_number).text.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.5:
+//   - UNIQUE (user_id, lower(name)) — expression index
+// ---------------------------------------------------------------------------
+
+model AiInstruction {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  name        String // user-visible label
+  instruction String // current text (denormalized from the latest version)
+  isActive    Boolean  @default(true) @map("is_active") // soft-disable without deleting history
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz
+
+  user     User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions AiInstructionVersion[]
+
+  @@map("ai_instructions")
+}
+
+// ---------------------------------------------------------------------------
+// Instruction version history. SCHEMA.md §6.6 — append-only; old versions are
+// never mutated, so "what did the AI know when it proposed X?" is always
+// answerable.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.6:
+//   - CHECK (source IN ('user','ai_suggestion'))
+// ---------------------------------------------------------------------------
+
+model AiInstructionVersion {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  instructionId String   @map("instruction_id") @db.Uuid
+  versionNumber Int      @map("version_number") // monotonic from 1
+  text          String   @map("instruction") // full text snapshot of this version (column: instruction)
+  source        String // 'user' | 'ai_suggestion'
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  instruction AiInstruction @relation(fields: [instructionId], references: [id], onDelete: Cascade)
+
+  @@unique([instructionId, versionNumber])
+  @@map("ai_instruction_versions")
+}
+
+// ---------------------------------------------------------------------------
+// AI-proposed organization actions. SCHEMA.md §6.7 — the ONLY way AI intent
+// touches the filesystem: a service executes the action through the same code
+// path as user-driven operations, then appends activity_events (A1/§12). AI
+// never writes database/sync state directly.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.7:
+//   - CHECK (action_type IN ('rename_file','move_file','delete_file',
+//     'rename_folder','move_folder','delete_folder','create_folder',
+//     'apply_tags','remove_tags','star_file','unstar_file'))
+//   - CHECK (status IN ('proposed','approved','rejected','executing',
+//     'executed','failed','cancelled'))
+//   - partial (user_id) WHERE status IN ('proposed','approved') — the
+//     pending-approval queue
+// State machine (application-enforced, §6.7): proposed → approved | rejected |
+// cancelled; approved → executing → executed | failed. Failed actions are
+// retryable in place (failed → executing) with proposed_params and provenance
+// preserved. SET NULL on conversation/message/targets is deliberate: the audit
+// record "this action happened" survives deletions (§6.7/§7).
+// ---------------------------------------------------------------------------
+
+model AiAction {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId              String    @map("user_id") @db.Uuid
+  conversationId      String?   @map("conversation_id") @db.Uuid
+  messageId           String?   @map("message_id") @db.Uuid
+  actionType          String    @map("action_type")
+  targetFileId        String?   @map("target_file_id") @db.Uuid
+  targetFolderId      String?   @map("target_folder_id") @db.Uuid
+  destinationFolderId String?   @map("destination_folder_id") @db.Uuid // move/create targets
+  proposedParams      Json      @map("proposed_params") // complete parameter snapshot; stays interpretable after target deletion
+  status              String
+  result              Json? // execution outcome (created/changed ids)
+  error               String? // failure detail when status = failed
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime  @default(now()) @map("updated_at") @db.Timestamptz
+  approvedAt          DateTime? @map("approved_at") @db.Timestamptz
+  executedAt          DateTime? @map("executed_at") @db.Timestamptz
+
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation      AiConversation?   @relation(fields: [conversationId], references: [id], onDelete: SetNull) // provenance survives (audit)
+  message           AiMessage?        @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  targetFile        File?             @relation(fields: [targetFileId], references: [id], onDelete: SetNull)
+  targetFolder      Folder?           @relation("AiActionTargetFolder", fields: [targetFolderId], references: [id], onDelete: SetNull)
+  destinationFolder Folder?           @relation("AiActionDestinationFolder", fields: [destinationFolderId], references: [id], onDelete: SetNull)
+  fileReferences    AiFileReference[] // citations pointing at this action as context
+
+  @@index([conversationId]) // provenance lookups (§6.7)
+  @@index([targetFileId])
+  @@index([targetFolderId])
+  @@map("ai_actions")
+}
+
+// ---------------------------------------------------------------------------
+// Generic AI tool-approval requests. SCHEMA.md §6.8 — a request for an
+// explicit user decision before an AI-requested tool call executes. Unlike
+// ai_actions (§6.7), this is NOT a filesystem-operations contract: it records
+// the REGISTERED TOOL NAME and its validated arguments, and applies to any
+// tool (read/write/destructive) the application-layer approval contract marks
+// as needing confirmation. Records are transient conversation state: deleting
+// the owning conversation (or message) deletes its approvals (CASCADE) — the
+// opposite of ai_actions' audit-survival SET NULL (§6.8/§7).
+// SECURITY (§6.8): `arguments` holds only the validated tool arguments needed
+// to identify the proposed operation — never provider responses, arbitrary
+// model output, API keys, credential handles, raw file contents, filesystem
+// paths, or provider secrets.
+// CUSTOM SQL REQUIRED IN MIGRATION — see SCHEMA.md §6.8:
+//   - CHECK (status IN ('pending','approved','rejected','expired'))
+//   - partial (user_id, expires_at) WHERE status = 'pending' — the pending
+//     approval queue plus expiry sweep
+// State machine (application-enforced, §6.8): pending → approved | rejected |
+// expired. decided_at records the moment a terminal decision is made.
+// ---------------------------------------------------------------------------
+
+model AiToolApproval {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  messageId      String   @map("message_id") @db.Uuid // the persisted turn that produced the tool request
+  toolName       String   @map("tool_name")
+  arguments      Json // validated tool arguments that identify the proposed operation
+  status         String
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @default(now()) @map("updated_at") @db.Timestamptz
+  expiresAt      DateTime @map("expires_at") @db.Timestamptz
+  decidedAt      DateTime? @map("decided_at") @db.Timestamptz // set only on a terminal decision
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  message      AiMessage     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt]) // user's approvals by state
+  @@index([conversationId, createdAt]) // per-conversation approval history
+  @@index([messageId]) // per-turn approvals
+  @@map("ai_tool_approvals")
+}

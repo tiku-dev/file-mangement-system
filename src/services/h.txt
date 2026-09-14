@@ -1,0 +1,450 @@
+# Phase 10.31 — Conversation turn-state exposure
+
+> Root: 0eaac09 `AI: resume instruction after approval`
+> This phase: `AI: expose conversation approval state`
+
+## Goal
+
+Expose the complete turn state of every AI conversation in the authenticated
+history API so a caller can tell, for each conversation, whether the last
+turn is `completed`, blocked on a decision (`awaiting-approval`), or ended in
+a terminal tool state (`approved` after approve+resume, `rejected`, `expired`)
+or `failed` — plus every currently-actionable pending approval. Both
+`GET /api/ai/conversations` (list) and `GET /api/ai/conversations/:id`
+(detail) now return `turnState` and `pendingApprovals` alongside their
+existing shapes; nothing else about the existing response or error envelopes
+changes.
+
+## What changed
+
+### Persistence (`agentConversations`, `aiToolApprovals`)
+- `agentConversations.listConversationLastMessages(userId, conversationIds)`
+  returns each OWNED conversation's LAST transcript row (chronological
+  `(createdAt, id)` order) as `{ conversationId, messageId, role, isFinal }`.
+  Ownership is enforced via the `conversation: { is: { userId } }` relation,
+  so a foreign conversation is indistinguishable from a missing one; empty
+  input returns `[]` without a database read.
+- `aiToolApprovals.listToolApprovalsForConversations(userId, conversationIds)`
+  returns EVERY owned approval across the conversations in ALL states
+  (pending/approved/rejected/expired), oldest-first (`createdAt` asc, then
+  stable `id`). Empty input short-circuits to `[]`.
+
+### Safe projection (`aiToolApprovals` service)
+- New shared `AiToolApproval` shape + pure `toAiApproval(record)`: ids, tool
+  name, validated arguments, status, ISO timestamps (`createdAt`/`updatedAt`/
+  `expiresAt`), `decidedAt`. The owner's `userId` is dropped (implied by
+  authentication). The route's private `toApprovalResponse` was replaced by
+  this shared projection, so the approvals API and the conversation history
+  API project through ONE content-free representation.
+- Service `listConversationToolApprovals(userId, conversationIds)` wraps the
+  repo read through `toAiApproval`.
+
+### Turn-state derivation (`aiConversations` service)
+- New `AiTurnState`: `completed | awaiting-approval | approved | rejected |
+  expired | failed`. `AiConversationSummary` and `AiConversationDetail` gain
+  `turnState` + `pendingApprovals` (extending a shared `AiConversationSummaryBase`).
+- `deriveConversationTurnState(isFinalReply, approvals, now)` — pure and
+  deterministic:
+  1. Any actionable pending approval (status `pending` AND `now < expiresAt`)
+     → `awaiting-approval`; `pendingApprovals` is exactly these actionable
+     rows, so an expired window is never surfaced as decidable.
+  2. Otherwise the approval with the most recent `updatedAt`: `approved` /
+     `rejected` by status, else (a pending row whose window elapsed) →
+     `expired`.
+  3. Otherwise, by the last transcript row: `is_final` assistant reply →
+     `completed`, else `failed`.
+- The derivation uses ALL of the conversation's approvals — deliberately NOT
+  the last user-message's slice — because after approve+resume (10.30) the
+  consumed approval belongs to the EARLIER segment while the persisted reply
+  is from the resumed round; per-segment filtering would misclassify a
+  resumed turn as `completed`.
+- Enrichment is batched (`list` runs `listConversationToolApprovals` +
+  `listConversationLastMessages` in parallel over the listed ids); `detail`
+  enriches AFTER the existing 404 check, so a foreign/missing conversation
+  never triggers an approvals query.
+- No tool execution, provider call, or network ever happens on these paths.
+
+## Verification
+
+- 918/918 tests pass (`pnpm test`), including new coverage:
+  - `agentConversations.test.ts` — `listConversationLastMessages`: last row
+    per OWNED conversation (foreign excluded), owner-only rows, `[]` without
+    a DB call (fake `aiMessage.findMany` extended for `conversationId.in` +
+    relation ownership).
+  - `aiToolApprovals.test.ts` — `listToolApprovalsForConversations`: all
+    states + ownership + oldest-first ordering, `[]` without a DB call.
+  - `aiToolApprovals` service / `aiConversations` service — pure derivation
+    units (recency ordering, exact-expiry boundary, awaiting-beats-stale),
+    list enrichment (batched reads over listed ids, per-conversation
+    completed/failed), detail enrichment (awaiting/approved/expired/404-first
+    no-query), safe `toAiApproval`.
+  - `ai.test.ts` — route-level turn-state passthrough for list + detail:
+    awaiting-approval with the safe projection (no `userId`), approved after
+    resume, rejected, expired (`pendingApprovals: []`), completed default,
+    same 404 envelope, and no tool/provider/network invocation.
+- `pnpm typecheck` clean; `pnpm build` clean.
+- Note on formatting: the workspace `web/node_modules/.bin/oxfmt` (v0.2.0)
+  was verified to corrupt TypeScript (it strips object/type-member
+  separators and flags even untouched committed files), so oxfmt was NOT run;
+  the changes deliberately match the committed code style.
+
+---
+
+# Phase 10.32 — Desktop AI conversation read-only UI foundation
+
+> Root: 925ea5e `AI: expose conversation approval state`
+> This phase: `AI: add desktop conversation view`
+
+## Goal
+
+Add the first real desktop frontend surface over the authenticated AI
+conversation/history APIs: a read-only conversation view (main `ai-assistant`
+view AND the Smart Assistant side panel) that renders ONLY persisted data —
+real user/assistant messages, the server-derived `turnState`, and, when the
+backend returns them, still-decidable approvals as read-only cards. No
+approve/reject actions, no tool execution from the frontend, no fabricated
+conversations/messages/approvals. Backend ownership/security stays
+authoritative; the frontend never infers permission or approval authority. A
+minimal, centralized, in-memory frontend session abstraction is introduced so
+the view can call the existing authenticated APIs. No backend changes were
+required — the 10.31 contract was sufficient.
+
+## Frontend changes (all under `web/`)
+
+### Session / auth (centralized, in-memory)
+- `src/services/session.ts` — the single owner of the bearer token. Rules:
+  token held in a module-level variable only; never in component state, never
+  in URL/query parameters, never persisted to localStorage/sessionStorage (no
+  secure OS-backed credential vault exists in the surrounding Tauri
+  architecture yet; after a reload the app shows the sign-in state again).
+  Reuses ONLY the existing `authApi` endpoints. Exposes `login` (stores
+  user+token, returns the user), `logout` (best-effort server revoke via the
+  EXISTING `POST /api/auth/logout`, then always clears local state),
+  `requireSessionToken` (throws `SessionNotAuthenticatedError` before any
+  unauthenticated request is issued), plus `subscribeSession`/`getSessionSnapshot`
+  for React's external store. No second authentication system.
+- `src/services/useSession.ts` — `useSyncExternalStore` binding returning
+  `{ user, isAuthenticated, login, logout }`; components never see the token.
+- `src/services/api/index.ts` — added `authApi.logout(token)` (the endpoint
+  already exists; only the typed client was missing).
+
+### Authenticated API client
+- `src/services/api/aiConversations.ts` — `listAiConversations()` and
+  `getAiConversation(id)` pull the token via `requireSessionToken()` at call
+  time and pass it to the existing `apiRequest` (`Authorization: Bearer`).
+  Unauthenticated calls fail fast with `SessionNotAuthenticatedError` and
+  never hit the network. Ownership/404 semantics come straight from the
+  backend envelope (typed `ApiClientError`).
+- `src/types/ai.ts` — frontend types mirroring the exact backend JSON for
+  `AiTurnState`, `AiConversationSummary`, `AiConversationDetail`,
+  `AiHistoryMessage`, and `AiToolApproval`.
+
+### Read-only conversation UI (shared by both surfaces)
+- `src/components/conversations/TurnStateBadge.tsx` — pill for every
+  server-derived turn state (list shows only non-completed states; the
+  transcript header always shows its badge).
+- `src/components/conversations/ConversationList.tsx` — real persisted
+  conversation rows (title or "Untitled conversation", updated date, turn
+  badge when relevant), newest-first as returned by the API.
+- `src/components/conversations/ConversationTranscript.tsx` — loading, error
+  (incl. conversation-not-found) and ready states; renders the persisted
+  messages chronologically (user right-aligned, assistant with avatar),
+  minimal safe tool-call/result metadata, a turn-state banner for every
+  relevant state (awaiting-approval/approved/rejected/expired/failed), and
+  pending approvals attached to their originating message id (strays grouped
+  under a "Pending approvals" block).
+- `src/components/conversations/ApprovalCard.tsx` — READ-ONLY card rendering
+  only safe metadata (tool name, validated arguments as key/value, status,
+  expiry). Deliberately renders NO approve/reject controls and states so.
+- `src/components/conversations/SignInPanel.tsx` — sign-in form reusing the
+  existing login abstraction; errors surface the backend message; token never
+  enters the URL or component state.
+- `src/components/views/AIHistoryView.tsx` — new main `ai-assistant` view:
+  header (user + refresh + sign out), list pane, transcript pane, auto-select
+  of the newest conversation, empty/loading/list-error/detail-error handling,
+  and a full-panel sign-in state when no session exists.
+- `src/components/AIAssistant.tsx` — the side panel now reads the SAME data
+  through the same session + API; the prior placeholder chat (canned messages,
+  quick prompts, composer, send button) was removed entirely.
+- `src/App.tsx` — `view === "ai-assistant"` now renders `<AIHistoryView />`
+  instead of the placeholder text.
+- `src/components/Icons.tsx` — added `RefreshCw` and `LogOut` (existing helper
+  pattern).
+
+### Test tooling (web)
+- Added devDependencies + `test` (`vitest run`), `test:watch`, and `typecheck`
+  (`tsc --noEmit`) scripts; `vitest.config.ts` (jsdom + `@` alias +
+  `src/test/setup.ts` importing `@testing-library/jest-dom/vitest`).
+
+## Verification
+
+- 30/30 web tests pass (`pnpm test` in `web/`):
+  - `session.test.ts` — unauth snapshot + `requireSessionToken` throws,
+    login stores only in memory (localStorage/sessionStorage stay empty),
+    login failure propagates and leaves unauthenticated state, subscriber
+    notification + snapshot replacement, logout revokes with the captured
+    token then clears, and logout clears even when the server revoke fails.
+  - `aiConversations.test.ts` — unauthenticated call fails fast with
+    `SessionNotAuthenticatedError` and issues NO request; authenticated list
+    and detail calls pass the session bearer token (URL-encoded id); backend
+    error envelopes propagate.
+  - `AIHistoryView.test.tsx` — sign-in state without fetching; sign-in
+    handoff to real history; list rows + real user/assistant message
+    rendering; all six turn-state badges/banners; non-completed list badges;
+    pending approval card with safe metadata and NO approve/reject/execute
+    buttons; empty state; loading state; list error + retry; owned-but-missing
+    conversation error; sign-out back to sign-in.
+  - `AIAssistant.test.tsx` — requires a session; the fabricated chat
+    (composer / quick prompts / send) is gone; opens a transcript from real
+    data with back navigation; close button still works.
+- `pnpm typecheck` (`tsc --noEmit`) clean; `pnpm build` (vite) clean.
+- No backend source changes were made. The workspace oxfmt (v0.2.0) defect
+  noted in 10.31 was respected: oxfmt was NOT run; new files/edits match the
+  existing committed style by hand. (Also: the local `backend/src/services/h.txt`
+  once appeared truncated to 0 bytes mid-session; it was restored from HEAD
+  before appending this report.)
+
+## Phase 10.34 — Desktop AI approval decisions
+
+Goal: pending approval cards in the desktop AI views are actionable — Approve /
+Reject — via the existing backend endpoints, the frontend never executes tools,
+and every rendered reply / turn state is reconciled from the authoritative
+server projection.
+
+Frontend (web workspace; Phase 10.33 composer work remains uncommitted on top of
+commits 925ea5e / 4ab9066):
+
+- `web/src/services/api/aiApprovals.ts` — typed clients for the existing
+  decision endpoints: `approveAiApproval(id)` / `rejectAiApproval(id)` issue
+  `POST /api/ai/approvals/:approvalId/{approve,reject}` with `encodeURIComponent`
+  and the centralized `requireSessionToken()`; returns the bare safe
+  `AiToolApproval` projection; backend 400/404 envelopes surface as typed
+  `ApiClientError`. Also exports `RESUME_AFTER_APPROVAL_INSTRUCTION =
+  "Continue after approval."` (the Phase 10.30 resume instruction).
+- `web/src/components/conversations/ApprovalCard.tsx` — rewritten to be
+  actionable. Controls render ONLY when the server reports `status ===
+  "pending"` (the only authoritative "still decidable" signal) and never
+  otherwise. Approve = `approveAiApproval` then resume the approved turn with
+  `submitAiInstruction({ approvalId, instruction: RESUME_AFTER_APPROVAL_INSTRUCTION })`
+  — React submits an instruction; the backend runtime executes the stored tool
+  arguments and may ask for a fresh approval. Reject = `rejectAiApproval` only,
+  nothing resumes. Both paths reconcile via `onReconcile(conversationId)`. While
+  a decision is in flight both controls disable (no duplicate submissions);
+  failures surface the backend's own message in a `role="alert"` and still
+  reconcile best-effort so the derived turn state (e.g. expired) renders.
+- `web/src/components/conversations/ConversationTranscript.tsx` — accepts
+  `onReconcile` and threads it into every attached and stray `ApprovalCard`; no
+  other UI changes.
+- `web/src/components/views/AIHistoryView.tsx` — `reconcileConversation =
+  loadList + loadDetail(conversationId)` passed as `onReconcile` so a decision
+  refreshes the list badges and the transcript from the server.
+- `web/src/components/AIAssistant.tsx` — same reconciliation (`loadList` +
+  `openConversation(conversationId)`) so the side panel stays consistent with
+  the main view.
+- `web/src/services/api/aiInstructions.ts` — `SubmitAiInstructionInput` now
+  documents the optional `approvalId` field used for approved-turn resumes.
+
+Tests (web workspace, 54/54 passing; `pnpm typecheck` and `pnpm build` clean):
+
+- `web/src/services/api/aiApprovals.test.ts` (4) — unauth fail-fast with NO
+  request issued; approve/reject POST with session bearer + URL-encoded id;
+  returned `AiToolApproval` projection; 400 expired envelope propagation.
+- `web/src/components/conversations/ApprovalCard.test.tsx` (7) — controls only
+  when server-side pending; non-pending shows server status without controls;
+  approve = decision + resume-through-instruction + reconcile; reject = decision
+  only + reconcile; in-flight disable blocks duplicate submission; backend error
+  surfaced via alert + still reconciles + never resumes; no execute/run
+  affordance.
+- `web/src/components/views/AIHistoryView.test.tsx` (25, +4 for decisions) —
+  the old "NO action controls" card test now asserts Approve/Reject render and
+  still NO execute/run; approve flow posts the decision, resumes via the
+  instruction endpoint, refetches (2nd GET), and renders the new assistant reply
+  ONLY from the reconciled projection before removing the consumed controls;
+  reject flow posts reject, never resumes, renders the `rejected` banner;
+  never-resolving approve keeps both controls disabled with no duplicate calls;
+  a stale/expired decision fails on the backend, never resumes, reconciles the
+  `expired` banner, and never fabricates a reply (the transient in-card server
+  error surfacing is asserted at the card level, since reconcile promptly
+  swaps in the authoritative projection).
+
+Constraints honored: no second approval system (reuses the existing endpoints);
+no tool execution from React (resume goes through the existing instruction
+endpoint); no client-side expiry/authority guessing (gating only on server
+`pending`); no fabricated messages/turn states (every render post-decision comes
+from the refetched conversation); backend behavior unchanged; tokens stay in the
+centralized session module (never component state, storage, or URLs); the main
+view and side panel reconcile identically. The workspace oxfmt (v0.2.0) defect
+continues to be respected: oxfmt was NOT run; edits match committed style by
+hand. (`backend/src/services/h.txt` appeared truncated a third time and was again
+restored from HEAD before appending.)
+
+## Phase 10.35 — AI tool execution runtime foundation
+
+Goal: a controlled, typed, deterministic backend boundary for AI-requested tool
+execution — the AI never touches the filesystem directly; every tool call goes
+through the existing registry → approval → policy → handler → executor runtime
+chain, with invalid and traversal-escaped paths rejected before any execution.
+
+### Existing foundation (confirmed, reused — NOT recreated)
+The repo's Phase 9.x–10.30 tool layer already provides the bulk of the
+"tool runtime":
+- typed tool contract: `RawToolInput` (untrusted input), `ToolExecutionResult`
+  (`ToolSuccessResult { ok, data }` / `ToolFailureResult { ok, error }`),
+  `ToolHandlerContext`, `ToolDefinition`/`ToolInputSchema`;
+- registry: `ToolRegistry` in `backend/src/tools/registry.ts` — exact-name
+  lookup, duplicate rejection, deterministic `tools/unknown-tool`;
+- explicit tool definitions without dynamic execution:
+  `backend/src/tools/definitions/readTools.ts` + the FROZEN handler map in
+  `backend/src/tools/handlers/index.ts` (no `eval`/`Function`/dynamic import —
+  dispatch only runs the closed map); implementations live in `handlers/`,
+  fully separate from the AI provider layer (`provider.ts`/`gemini-roetc.`);
+- typed errors: `ToolError` with `category` (validation / unknown_tool /
+  not_found / security / internal) in `backend/src/tools/errors.ts`;
+- runtime connection + approval preservation: `tools.ts::invokeTool` runs the
+  chain registry → APPROVAL gate (`requiresApproval` tools stop before
+  policy/handler/executor and create a pending approval; approval resume runs
+  ONLY the stored validated args) → `dispatchTool` (policy → handler →
+  executor). `persistentAgentTurn` persists each tool round through the eager
+  conversation/message rows + `completeAgentTurn`; `aiInstructions` maps known
+  failures to safe `AppError`s (never raw stacks, never file contents).
+
+### What changed this phase
+1. `backend/src/tools/paths.ts` (NEW) — deterministic, tool-layer path-scope
+   guard. `validateToolPath(path)`:
+   - rejects RELATIVE paths → `validation` / `tools/invalid-path`
+     (an absolute path is required: POSIX `/`, Windows drive `X:\`, or UNC);
+   - rejects NUL/control characters → `validation` / `tools/invalid-path`;
+   - rejects ROOT-ESCAPING traversal (`..` climbing above the root) →
+     `security` / `tools/path-out-of-scope`. `/a/../b` (stays in-root) is
+     accepted; it returns the ORIGINAL string verbatim so the Rust `AllowList`
+     (canonical-path containment against the home directory) remains the final
+     scope authority. Pure/shape-only: no I/O, no normalization-on-disk, no
+     symlink resolution. Messages never include the raw path.
+2. `backend/src/tools/errors.ts` (EDIT, additive) — two new stable codes:
+   `tools/invalid-path` and `tools/path-out-of-scope`.
+3. `backend/src/tools/handlers/listDirectory.ts` (EDIT) — `list_directory`
+   (the ONE tool wired this phase) now runs `validateToolPath` after
+   `requireString`, so unusable/traversal paths never reach the executor.
+   The existing list_directory contract is unchanged: input `{ path }`,
+   output the safe `DirectoryListing` (entries + name/path/type/size/
+   timestamps metadata for AI reasoning); never returns file contents.
+4. Tests (backend, 958 passing total; `pnpm typecheck` + `pnpm build` clean):
+   - `backend/src/tools/paths.test.ts` (NEW) — valid absolute (POSIX/drive/
+     UNC/root) accepted verbatim; in-root dot-dot accepted; relative + control
+     chars → validation/invalid-path; root-escaping cases (POSIX + windows +
+     UNC) → security/path-out-of-scope; public-safe messages.
+   - `backend/src/tools/handlers/handlers.test.ts` (EXTENDED) — relative path
+     → validation/invalid-path, traversal → security/path-out-of-scope, both
+     with `fake.calls.listDirectory === []` (executor NEVER reached); valid
+     absolute path passed through unchanged.
+   - `backend/src/tools/security.test.ts` (NEW) — no arbitrary execution:
+     handlers map is `Object.freeze`d and closed; hostile/mangled tool names
+     (`eval`, `exec`, `spawn`, `require`, `child_process`, `sudo`,
+     `list_directory;rm -rf /`, `list_directory && curl …`, `../..`, `""`) →
+     `unknown_tool`, filesystem untouched; a mechanically REGISTERED
+     handler-less name (`eval`) still cannot execute → `internal`
+     handler-missing, filesystem untouched; exact-name lookup rejects
+     near-misses; only the real `list_directory` route reaches the executor.
+   - Known/unknown resolution, permission→security mapping, structured
+     results, execution-failure→internal, and approval-stops-before-execution
+     were already covered by the existing `registry.test.ts`,
+     `handlers.test.ts`, `tools.test.ts`, `aiInstructionApprovals.test.ts`,
+     `toolApprovalGate.test.ts`, and `policy.test.ts` suites.
+
+### Where authorization / path-scope enforcement occurs
+- AUTH: `createSessionExecutionContext` → `createToolExecutionContext`
+  (identity from `requireAuth`, never from tool args/provider output) +
+  `defaultToolPolicy` (active user required) before any handler runs.
+- APPROVAL: `invokeTool` requires an executable owned approval for
+  `requiresApproval` tools; without one it stops at CREATE (never executes).
+- PATH SCOPE: (1) tool layer now rejects relative/control/traversal paths in
+  `paths.ts`; (2) the desktop Rust `fs_service` `AllowList` enforces canonical
+  membership against the home directory — final authority. No shell commands,
+  no arbitrary code, no dynamic import; tool registrations are static metadata
+  and names never resolve to code by convention.
+
+### How approval boundaries are preserved
+Unchanged. `list_directory` declares `requiresApproval` absent (default safe
+read: no approval), and the approval gate sits in `invokeTool`, untouched.
+Any future approval-bestowing change to a definition flows through the SAME
+gate; nothing in this phase bypasses or weakens it.
+
+### Assumptions / limitations
+- Scope shape guard is platform-aware but the desktop scope is macOS/POSIX;
+  Windows drive/UNC cases are validated at the SHAPE level only and their final
+  membership remains the Rust AllowList's job (which also canonicalizes, so
+  symlinks are neutralized there, not here).
+- Only `list_directory` is wired to the guard this phase. `search_files`,
+  `get_file_metadata`, and `read_file` still delegate to the executor with only
+  `requireString` validation and remain fully guarded at execution by the
+  existing Rust AllowList — they get the same `validateToolPath` treatment
+  when their phases land.
+- No new execution path was introduced; the phase hardened the existing one.
+- oxfmt (workspace defect) was NOT run; edits match committed style.
+  (`backend/src/services/h.txt` appeared truncated a FOURTH time; restored from
+  HEAD before appending.)
+
+---
+
+# Phase 10.37 — Complete path-scope validation for the remaining read tools
+
+> Root: 8979673 `AI: add controlled move_file tool`
+> This phase: (uncommitted) — completes the Phase 10.35 `validateToolPath`
+> first-gate for the three read tools that still passed only `requireString`
+> validation. The Phase 10.36 milestone note is absent from this file (the
+> move_file commit landed without appending it; the write-tool behavior it
+> described is documented in `backend/src/tools/definitions/writeTools.ts`,
+> `backend/src/tools/handlers/moveFile.ts`, and the change's commit).
+
+## Goal
+
+Extend the deterministic tool-layer path-scope guard from `list_directory`
+(Phase 10.35, and `move_file` preflight/execution in 10.36) to `get_file_metadata`
+and `read_file`, so EVERY tool that accepts a user-controlled filesystem path
+rejects relative / control-character / root-escaping paths BEFORE the executor
+or filesystem is reached. `search_files` is included for completeness but has NO
+path argument — its `query` is a filename substring confined to the AllowList
+roots, so it is explicitly NOT path-validated; it instead rejects NUL / control
+characters via the same shared guard helper.
+
+## What changed
+
+1. `backend/src/tools/paths.ts` (EDIT) — new exported `hasControlCharacters()`
+   (ASCII < 0x20), extracted from `validateToolPath`'s loop so the control-
+   character rule is single-sourced. `validateToolPath` behavior is UNCHANGED
+   (same rejects, same codes, verbatim pass-through on success).
+2. `backend/src/tools/handlers/getFileMetadata.ts` (EDIT) — runs
+   `validateToolPath(path)` after `requireString`; the executor receives the
+   guard's verbatim path. Contract unchanged: `{ path }` → `FileMetadata`;
+   relative → `validation`/`tools/invalid-path`, traversal → `security`/
+   `tools/path-out-of-scope`, executor never called on rejection.
+3. `backend/src/tools/handlers/readFile.ts` (EDIT) — identical treatment for
+   `read_file`. Contract unchanged: `{ path }` → base64 output.
+4. `backend/src/tools/handlers/searchFiles.ts` (EDIT) — rejects NUL / control
+   characters in `query` as `validation`/`tools/invalid-input` before the
+   executor; traversal-looking queries remain valid SUBSTRINGS (never treated
+   as paths) and pass through unchanged. Read tools remain NON-approval-gated.
+5. Tests (backend, 981 passing total; `pnpm typecheck` + `pnpm build` clean):
+   - `backend/src/tools/handlers/handlers.test.ts` (EXTENDED) for
+     `get_file_metadata` and `read_file`: relative → validation/invalid-path,
+     control-character → validation/invalid-path, traversal → security/
+     path-out-of-scope, all with `fake.calls.* === []` (executor NEVER
+     reached); valid absolute path passed through UNCHANGED. For
+     `search_files`: control-character query → validation/invalid-input with
+     the executor never called; a traversal-looking query passes through as a
+     substring (documents that queries are not paths).
+   - `backend/src/tools/paths.test.ts` (EXTENDED) — unit coverage for the new
+     `hasControlCharacters` (printable/DEL accepted, NUL + C0 rejected).
+6. No changes to `backend/src/services/h.txt`'s section headers, no new tools,
+   no definition/permission/policy/approval changes — read tools stay ungated
+   (`ToolPermission.Read`, no `requiresApproval`).
+
+## Verification
+
+- 981/981 backend tests pass (`pnpm test`): 37 files; `pnpm typecheck` clean.
+- Web workspace unaffected: 54/54 web tests pass (`pnpm test` in `web/`).
+- Path normalization audit (pre-change): no handler normalizes or re-derives
+  paths; `paths.ts` returns the original string verbatim and the Rust AllowList
+  remains the single canonical-scope authority at execution. No existing
+  normalization assumptions were disturbed.
+- oxfmt (workspace defect) was NOT run; edits match committed style.

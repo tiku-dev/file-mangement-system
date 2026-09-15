@@ -17,6 +17,7 @@ import type { AgentToolResult } from "./agent.js";
 import { composeDefaultProviderStack } from "./providerComposition.js";
 import type { AgentProvider } from "./provider.js";
 import { isProviderError } from "./provider.js";
+import type { AiRuntimeStatus } from "./aiStatus.js";
 
 export const MOBILE_PROTOCOL_VERSION = "1";
 export const MAX_MOBILE_INSTRUCTION_LENGTH = 4096;
@@ -180,5 +181,42 @@ export function getMobileCapabilities() {
       requiresApproval: requiresToolApproval(tool),
       inputSchema: tool.inputSchema,
     })),
+  };
+}
+
+/**
+ * Safe, authenticated configuration used to bootstrap the mobile UI.
+ *
+ * File browsing, search, storage totals, and destructive actions remain
+ * client-side because the backend must never access a phone filesystem. This
+ * payload tells a frontend which shared capabilities are available and makes
+ * that privacy boundary explicit to the UI.
+ */
+export function getMobileBootstrap(user: {
+  id: string;
+  email: string;
+  displayName: string;
+  status: string;
+}, ai: AiRuntimeStatus) {
+  return {
+    protocolVersion: MOBILE_PROTOCOL_VERSION,
+    user,
+    privacy: {
+      mode: "on-device" as const,
+      serverFilesystemAccess: false,
+      rawFileUpload: false,
+      destructiveActionsRequireApproval: true,
+    },
+    features: {
+      home: true,
+      browse: true,
+      search: true,
+      settings: true,
+      assistant: true,
+      activity: true,
+      darkMode: true,
+    },
+    ai,
+    capabilities: getMobileCapabilities(),
   };
 }

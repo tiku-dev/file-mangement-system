@@ -23,16 +23,25 @@ from `POST /api/auth/login`.
 ## Mobile flow
 
 1. Log in or register, then send `Authorization: Bearer <token>` on all calls.
-2. Call `GET /api/mobile/capabilities` to discover the supported operation
+2. Call `GET /api/mobile/bootstrap` to load the authenticated user, privacy
+   boundary, UI feature flags, AI provider status, and mobile capabilities in
+   one request.
+3. Call `GET /api/mobile/capabilities` to discover the supported operation
    schemas and which calls require confirmation.
-3. Send a prompt to `POST /api/mobile/plan`.
-4. For read operations, the app validates paths against its local allow-list,
+4. Send a prompt to `POST /api/mobile/plan`.
+5. For read operations, the app validates paths against its local allow-list,
    executes through Android/iOS APIs, and sends a small metadata result back in
    the next `/plan` request.
-5. Before every operation whose `requiresApproval` is `true`, display the
+6. Before every operation whose `requiresApproval` is `true`, display the
    exact proposed operation to the user. Execute it only after approval.
-6. Send the result back to `/plan` with the same original instruction. Repeat
+7. Send the result back to `/plan` with the same original instruction. Repeat
    until the response has no operations.
+
+`/api/mobile/bootstrap` does not return phone files or storage statistics. The
+Flutter client owns those values because the backend never has access to the
+phone filesystem. The client can use the returned feature flags and
+capabilities to render the Home, Browse, Search, Settings, Activity, and AI
+Assistant screens shown in the design.
 
 Example planning request:
 

@@ -75,7 +75,7 @@ export const config = {
   /** TCP port for the HTTP server. */
   port: intFromEnv(process.env.PORT) ?? 4000,
   /** Bind address. Loopback by default — never expose the API unintentionally. */
-  host: process.env.HOST ?? "127.0.0.1",
+  host: process.env.HOST ?? "0.0.0.0",
   /** Browser/webview origins allowed by CORS. */
   corsOrigins: listFromEnv(process.env.CORS_ORIGINS) ?? DEFAULT_DEV_ORIGINS,
   /** Session lifetime in hours (Phase 7). Safe production-oriented default. */

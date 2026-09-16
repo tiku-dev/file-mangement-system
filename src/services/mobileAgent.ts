@@ -11,7 +11,7 @@ import {
   readToolDefinitions,
 } from "../tools/definitions/readTools.js";
 import { writeToolDefinitions } from "../tools/definitions/writeTools.js";
-import { requiresToolApproval, type ToolDefinition } from "../tools/types.js";
+import { requiresToolApproval, ToolPermission, type ToolDefinition } from "../tools/types.js";
 import { ToolError, ToolErrorCode } from "../tools/errors.js";
 import type { AgentToolResult } from "./agent.js";
 import { composeDefaultProviderStack } from "./providerComposition.js";
@@ -24,11 +24,105 @@ export const MAX_MOBILE_INSTRUCTION_LENGTH = 4096;
 export const MAX_MOBILE_TOOL_RESULTS = 16;
 export const MAX_MOBILE_TOOL_RESULT_BYTES = 65_536;
 
+const createFileDefinition: ToolDefinition = {
+  name: "create_file",
+  description: "Create a new file at the specified path with optional text content. Requires user approval.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Absolute path of the file to create." },
+      content: { type: "string", description: "Initial text content of the file." },
+    },
+    required: ["path"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
+const createFolderDefinition: ToolDefinition = {
+  name: "create_folder",
+  description: "Create a new folder / directory at the specified path. Requires user approval.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Absolute path of the directory to create." },
+    },
+    required: ["path"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
+const renameFileDefinition: ToolDefinition = {
+  name: "rename_file",
+  description: "Rename an existing file or folder to a new name. Requires user approval.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Absolute path of the item to rename." },
+      newName: { type: "string", description: "New name for the file or folder." },
+    },
+    required: ["path", "newName"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
+const deleteFileDefinition: ToolDefinition = {
+  name: "delete_file",
+  description: "Delete an existing file or folder. Destructive operation that requires user confirmation.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Absolute path of the file or folder to delete." },
+    },
+    required: ["path"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
+const editFileDefinition: ToolDefinition = {
+  name: "edit_file",
+  description: "Update the text content of an existing file. Requires user approval.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Absolute path of the file to update." },
+      content: { type: "string", description: "New content for the file." },
+    },
+    required: ["path", "content"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
+const organizeFilesDefinition: ToolDefinition = {
+  name: "organize_files",
+  description: "Batch organize files in a folder into category subfolders (e.g. Documents, Photos, Audio, APKs). Requires user approval.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      sourceDirectory: { type: "string", description: "Absolute path of the folder to organize." },
+      strategy: { type: "string", description: "Strategy: 'by_type', 'by_date', or 'clean_duplicates'." },
+    },
+    required: ["sourceDirectory"],
+  },
+  permission: ToolPermission.Write,
+  requiresApproval: true,
+};
+
 // Do not offer raw-content reads to the mobile planner. File content may only
 // be shared in a separate, explicit feature with its own privacy consent.
 const MOBILE_TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   ...readToolDefinitions.filter((tool) => tool.name !== "read_file"),
   ...writeToolDefinitions,
+  createFileDefinition,
+  createFolderDefinition,
+  renameFileDefinition,
+  deleteFileDefinition,
+  editFileDefinition,
+  organizeFilesDefinition,
 ]);
 
 const MOBILE_BODY_FIELDS = new Set(["instruction", "toolResults"]);

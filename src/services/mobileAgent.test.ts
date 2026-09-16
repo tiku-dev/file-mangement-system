@@ -14,6 +14,12 @@ const provider: AgentProvider = {
       "search_files",
       "get_file_metadata",
       "move_file",
+      "create_file",
+      "create_folder",
+      "rename_file",
+      "delete_file",
+      "edit_file",
+      "organize_files",
     ]);
     return {
       text: "I found a file that can be organized.",

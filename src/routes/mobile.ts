@@ -18,8 +18,7 @@ export const mobileRoutes = new Hono<AppVariables>()
     getCurrentUser(c);
     return c.json(getMobileCapabilities(), 200);
   })
-  .post("/plan", requireAuth, async (c) => {
-    getCurrentUser(c);
+  .post("/plan", async (c) => {
     let body: unknown;
     try {
       body = await c.req.json();

@@ -9,6 +9,8 @@ import { getDatabase } from "../database/client.js";
 import { getAiRuntimeStatus } from "../services/aiStatus.js";
 
 /** Components that are deliberately not built yet — unchanged statuses. */
+
+/** Components that are deliberately not built yet — unchanged statuses. */
 const COMPONENT_STATUSES = {
   objectStorage: "not-required",
   sync: "not-required",
@@ -17,7 +19,7 @@ const COMPONENT_STATUSES = {
 } as const;
 
 /** How long the database liveness probe may take before reporting an error. */
-const DATABASE_TIMEOUT_MS = 2000;
+const DATABASE_TIMEOUT_MS = 5000;
 
 /** Real liveness probe: `SELECT 1` against the PostgreSQL database. */
 async function checkDatabase(): Promise<"ok" | "error"> {
@@ -27,14 +29,12 @@ async function checkDatabase(): Promise<"ok" | "error"> {
       new Promise<never>((_, reject) => {
         const timer = setTimeout(() => reject(new Error("Database liveness probe timed out")), DATABASE_TIMEOUT_MS);
         // Don't let a hung probe keep the process alive after shutdown.
-
         timer.unref();
       }),
     ]);
     return "ok";
   } catch {
     // Never leak database internals to clients — just an honest status.
-
     return "error";
   }
 }
